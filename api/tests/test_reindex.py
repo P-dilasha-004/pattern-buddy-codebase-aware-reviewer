@@ -152,23 +152,38 @@ class TestProcessReindex:
         mock_qdrant.assert_not_called()
         mock_dl.assert_not_called()
 
+    @staticmethod
+    def _patch_ingest_internals(walk_return=None, chunk_return=None):
+        """
+        Common patches for the batched reindex path. Returns a dict of the
+        mocks so tests can assert on them. walk_return: list of (path, text);
+        chunk_return: list of chunk objects per file.
+        """
+        walk_return = walk_return if walk_return is not None else [("src/a.py", "code")]
+        chunk_return = chunk_return if chunk_return is not None else [MagicMock()]
+        return {
+            "_walk_repo": patch("api.main._walk_repo", return_value=walk_return),
+            "_chunk_file": patch("api.main._chunk_file", return_value=chunk_return),
+            "_embed_chunks": patch("api.main._embed_chunks", return_value=[[0.1, 0.2]]),
+            "_upsert_batch": patch("api.main._upsert_batch"),
+        }
+
     @pytest.mark.asyncio
     async def test_delete_is_repo_wide_not_scoped_to_a_file(self):
         """
-        Task 4.3 explicitly calls for a *global* DELETE by repo_id (unlike
-        4.2's per-file delete) so files removed since the last successful
-        sync don't orphan. Assert the filter has no file_path condition.
+        Task 4.3 calls for a *global* DELETE by repo_id (unlike 4.2's per-file
+        delete) so files removed since the last sync don't orphan. Assert the
+        filter has no file_path condition.
         """
         import api.main as m
         fake_client = MagicMock()
+        p = self._patch_ingest_internals()
 
         with patch("api.main._get_qdrant", return_value=fake_client), \
              patch("api.main._get_embedder", return_value=MagicMock()), \
-             patch("api.main._download_zipball", new_callable=AsyncMock,
-                   return_value=b"zipbytes"), \
+             patch("api.main._download_zipball", new_callable=AsyncMock, return_value=b"zipbytes"), \
              patch("api.main._extract_zipball", return_value="/tmp/fake_repo"), \
-             patch("api.main.ingest_repository",
-                   return_value={"files_processed": 3, "chunks_upserted": 10, "files_skipped": 0}), \
+             p["_walk_repo"], p["_chunk_file"], p["_embed_chunks"], p["_upsert_batch"], \
              patch("shutil.rmtree") as mock_rmtree:
             await m._process_reindex({"repo_id": "owner/repo", "branch": "main"})
 
@@ -176,70 +191,67 @@ class TestProcessReindex:
         _, kwargs = fake_client.delete.call_args
         conditions = kwargs["points_selector"].filter.must
         keys = {c.key for c in conditions}
-        assert keys == {"repo_id"}  # no file_path condition — this is a full tenant wipe
+        assert keys == {"repo_id"}  # no file_path condition — full tenant wipe
         assert conditions[0].match.value == "owner/repo"
         mock_rmtree.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_ingest_repository_called_with_extracted_path_and_repo_id(self):
-        import api.main as m
-        fake_client = MagicMock()
-        fake_embedder = MagicMock()
-
-        with patch("api.main._get_qdrant", return_value=fake_client), \
-             patch("api.main._get_embedder", return_value=fake_embedder), \
-             patch("api.main._download_zipball", new_callable=AsyncMock,
-                   return_value=b"zipbytes"), \
-             patch("api.main._extract_zipball", return_value="/tmp/fake_repo_root") as mock_extract, \
-             patch("api.main.ingest_repository",
-                   return_value={"files_processed": 1, "chunks_upserted": 2, "files_skipped": 0}) as mock_ingest, \
-             patch("shutil.rmtree"):
-            await m._process_reindex({"repo_id": "owner/repo", "branch": "develop",
-                                       "commit_hash": "deadbeef"})
-
-        mock_extract.assert_called_once_with(b"zipbytes", mock_extract.call_args[0][1])
-        mock_ingest.assert_called_once()
-        _, kwargs = mock_ingest.call_args
-        assert kwargs["repo_path"] == "/tmp/fake_repo_root"
-        assert kwargs["repo_id"] == "owner/repo"
-        assert kwargs["commit_hash"] == "deadbeef"
-        assert kwargs["qdrant_client"] is fake_client
-
-    @pytest.mark.asyncio
-    async def test_ingest_repository_reuses_shared_embedder_not_a_fresh_one(self):
+    async def test_embed_uses_shared_singleton_embedder(self):
         """
-        Regression test: ingest_repository must be called with the API's
-        cached singleton embedder, not left to load its own independent
-        copy of the ~1GB model. Loading a second copy on top of whatever
-        /review or /sync already cached is what caused the OOM kills.
+        Regression: the embed step must use the API's cached singleton embedder
+        (loaded once), not a fresh ~1GB copy. Assert _embed_chunks is called
+        with the exact object _get_embedder returns.
         """
         import api.main as m
         fake_embedder = MagicMock()
+        p = self._patch_ingest_internals()
 
         with patch("api.main._get_qdrant", return_value=MagicMock()), \
              patch("api.main._get_embedder", return_value=fake_embedder) as mock_get_embedder, \
-             patch("api.main._download_zipball", new_callable=AsyncMock,
-                   return_value=b"zipbytes"), \
+             patch("api.main._download_zipball", new_callable=AsyncMock, return_value=b"zipbytes"), \
              patch("api.main._extract_zipball", return_value="/tmp/fake_repo"), \
-             patch("api.main.ingest_repository",
-                   return_value={"files_processed": 1, "chunks_upserted": 1, "files_skipped": 0}) as mock_ingest, \
+             p["_walk_repo"], p["_chunk_file"], p["_embed_chunks"] as mock_embed, p["_upsert_batch"], \
              patch("shutil.rmtree"):
             await m._process_reindex({"repo_id": "owner/repo"})
 
         mock_get_embedder.assert_called_once()
-        _, kwargs = mock_ingest.call_args
-        assert kwargs["embedder"] is fake_embedder
+        # every _embed_chunks call gets the shared embedder as 2nd positional arg
+        assert mock_embed.call_args_list, "embedding never ran"
+        for call in mock_embed.call_args_list:
+            assert call.args[1] is fake_embedder
+
+    @pytest.mark.asyncio
+    async def test_embedding_runs_in_batches_yielding_between(self):
+        """
+        The embed loop must process chunks in bounded batches (yielding to the
+        event loop between each) so uvicorn's gunicorn liveness heartbeat keeps
+        firing — otherwise a single long executor call gets the worker
+        SIGKILL'd at ~30s. With 40 chunks and batch size 16, expect 3 batches.
+        """
+        import api.main as m
+        chunks = [MagicMock() for _ in range(40)]
+        # one file whose chunker yields all 40 chunks
+        p = self._patch_ingest_internals(walk_return=[("big.py", "x")], chunk_return=chunks)
+
+        with patch("api.main._get_qdrant", return_value=MagicMock()), \
+             patch("api.main._get_embedder", return_value=MagicMock()), \
+             patch("api.main._download_zipball", new_callable=AsyncMock, return_value=b"zipbytes"), \
+             patch("api.main._extract_zipball", return_value="/tmp/fake_repo"), \
+             p["_walk_repo"], p["_chunk_file"], p["_embed_chunks"], p["_upsert_batch"] as mock_upsert, \
+             patch("shutil.rmtree"):
+            await m._process_reindex({"repo_id": "owner/repo"})
+
+        assert mock_upsert.call_count == 3  # ceil(40 / 16)
 
     @pytest.mark.asyncio
     async def test_temp_dir_cleaned_up_after_success(self):
         import api.main as m
+        p = self._patch_ingest_internals()
         with patch("api.main._get_qdrant", return_value=MagicMock()), \
              patch("api.main._get_embedder", return_value=MagicMock()), \
-             patch("api.main._download_zipball", new_callable=AsyncMock,
-                   return_value=b"zipbytes"), \
+             patch("api.main._download_zipball", new_callable=AsyncMock, return_value=b"zipbytes"), \
              patch("api.main._extract_zipball", return_value="/tmp/fake_repo"), \
-             patch("api.main.ingest_repository",
-                   return_value={"files_processed": 1, "chunks_upserted": 1, "files_skipped": 0}), \
+             p["_walk_repo"], p["_chunk_file"], p["_embed_chunks"], p["_upsert_batch"], \
              patch("shutil.rmtree") as mock_rmtree, \
              patch("tempfile.mkdtemp", return_value="/tmp/pattern_buddy_reindex_xyz"):
             await m._process_reindex({"repo_id": "owner/repo"})
@@ -251,10 +263,9 @@ class TestProcessReindex:
         import api.main as m
         with patch("api.main._get_qdrant", return_value=MagicMock()), \
              patch("api.main._get_embedder", return_value=MagicMock()), \
-             patch("api.main._download_zipball", new_callable=AsyncMock,
-                   return_value=b"zipbytes"), \
+             patch("api.main._download_zipball", new_callable=AsyncMock, return_value=b"zipbytes"), \
              patch("api.main._extract_zipball", return_value="/tmp/fake_repo"), \
-             patch("api.main.ingest_repository", side_effect=RuntimeError("ingest boom")), \
+             patch("api.main._walk_repo", side_effect=RuntimeError("walk boom")), \
              patch("shutil.rmtree") as mock_rmtree, \
              patch("tempfile.mkdtemp", return_value="/tmp/pattern_buddy_reindex_xyz"):
             await m._process_reindex({"repo_id": "owner/repo"})  # must not raise
@@ -267,24 +278,24 @@ class TestProcessReindex:
         with patch("api.main._get_qdrant", return_value=MagicMock()), \
              patch("api.main._download_zipball", new_callable=AsyncMock,
                    side_effect=RuntimeError("network boom")) as mock_dl, \
-             patch("api.main.ingest_repository") as mock_ingest, \
+             patch("api.main._walk_repo") as mock_walk, \
              patch("shutil.rmtree") as mock_rmtree:
             await m._process_reindex({"repo_id": "owner/repo"})  # must not raise
 
         mock_dl.assert_called_once()
-        mock_ingest.assert_not_called()
+        mock_walk.assert_not_called()
         mock_rmtree.assert_not_called()  # tmp_dir was never created
 
     @pytest.mark.asyncio
     async def test_defaults_to_main_branch_when_omitted(self):
         import api.main as m
+        p = self._patch_ingest_internals()
         with patch("api.main._get_qdrant", return_value=MagicMock()), \
              patch("api.main._get_embedder", return_value=MagicMock()), \
              patch("api.main._download_zipball", new_callable=AsyncMock,
                    return_value=b"zipbytes") as mock_dl, \
              patch("api.main._extract_zipball", return_value="/tmp/fake_repo"), \
-             patch("api.main.ingest_repository",
-                   return_value={"files_processed": 0, "chunks_upserted": 0, "files_skipped": 0}), \
+             p["_walk_repo"], p["_chunk_file"], p["_embed_chunks"], p["_upsert_batch"], \
              patch("shutil.rmtree"):
             await m._process_reindex({"repo_id": "owner/repo"})  # no "branch" key
 

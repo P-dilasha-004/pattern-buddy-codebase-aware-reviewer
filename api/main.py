@@ -33,6 +33,7 @@ from api.inference import call_inference, post_github_comment, FALLBACK_COMMENT
 from ingestion.pipeline import (
     QDRANT_COLLECTION,
     ingest_repository,
+    _walk_repo,
     _delete_file_vectors,
     _chunk_file,
     _embed_chunks,
@@ -463,23 +464,49 @@ async def _process_reindex(payload: dict[str, Any]) -> None:
 
     tmp_dir: str | None = None
     try:
+        from pathlib import Path as _Path
+
+        loop = asyncio.get_event_loop()
+        commit_hash   = payload.get("commit_hash", "weekly-rebuild")
+        embedder      = _get_embedder()
+
         zip_bytes = await _download_zipball(repo_id, branch, _PAT)
         tmp_dir = tempfile.mkdtemp(prefix="pattern_buddy_reindex_")
         repo_root = _extract_zipball(zip_bytes, tmp_dir)
 
-        def _reingest():
-            return ingest_repository(
-                repo_path=repo_root,
-                repo_id=repo_id,
-                commit_hash=payload.get("commit_hash", "weekly-rebuild"),
-                qdrant_client=client,
-                embedder=_get_embedder(),
-            )
+        # Walk + chunk (fast, I/O-light) in one executor hop.
+        def _walk_and_chunk():
+            files = _walk_repo(_Path(repo_root))
+            chunks = []
+            for rel_path, source_text in files:
+                for c in _chunk_file(rel_path, source_text):
+                    chunks.append(c)
+            return len(files), chunks
 
-        result = await asyncio.get_event_loop().run_in_executor(None, _reingest)
+        files_count, all_chunks = await loop.run_in_executor(None, _walk_and_chunk)
+        logger.info("reindex_chunked repo=%s files=%d chunks=%d", repo_id, files_count, len(all_chunks))
+
+        # Embed + upsert in small batches, awaiting each separately. Returning to
+        # the event loop between batches lets uvicorn refresh its gunicorn liveness
+        # heartbeat; a single long executor call starves it and the arbiter
+        # SIGKILLs the worker at ~30s (root cause of the reindex "OOM" — memory
+        # was never the issue; measured peak <1GB).
+        REINDEX_BATCH = 16
+        chunks_upserted = 0
+
+        def _embed_upsert(batch):
+            vectors = _embed_chunks(batch, embedder)
+            _upsert_batch(client, batch, vectors, repo_id, commit_hash)
+            return len(batch)
+
+        for i in range(0, len(all_chunks), REINDEX_BATCH):
+            batch = all_chunks[i:i + REINDEX_BATCH]
+            chunks_upserted += await loop.run_in_executor(None, _embed_upsert, batch)
+            await asyncio.sleep(0)  # yield so the heartbeat task can run
+
         logger.info(
-            "reindex_complete repo=%s files=%d chunks=%d skipped=%d",
-            repo_id, result["files_processed"], result["chunks_upserted"], result["files_skipped"],
+            "reindex_complete repo=%s files=%d chunks=%d",
+            repo_id, files_count, chunks_upserted,
         )
     except Exception as exc:
         logger.error("reindex_failed repo=%s error=%s", repo_id, exc, exc_info=True)
