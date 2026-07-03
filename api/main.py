@@ -61,10 +61,18 @@ def _get_qdrant() -> "QdrantClient":
         api_key=os.environ.get("QDRANT_API_KEY", ""),
     )
 
+# Cap ONNX Runtime intra-op threads. On the single-worker (-w 1) App Service,
+# an uncapped embedder pegs every core during ingestion, starves the asyncio
+# event-loop thread that answers Azure's container health pings, and the worker
+# gets SIGKILL'd ~30s in (misreported by gunicorn as "out of memory" — measured
+# peak was <1GB). Leaving a core free keeps the loop responsive. Configurable so
+# it can be tuned per plan (B3 = 4 vCores → default 2).
+_EMBED_THREADS: int = int(os.environ.get("EMBED_THREADS", "2"))
+
 # Loaded once at startup — reloading the ONNX model per request causes OOM on App Service.
 def _load_embedder():
     from fastembed import TextEmbedding
-    return TextEmbedding(model_name="nomic-ai/nomic-embed-text-v1.5")
+    return TextEmbedding(model_name="nomic-ai/nomic-embed-text-v1.5", threads=_EMBED_THREADS)
 
 _embedder = None
 
