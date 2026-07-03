@@ -74,8 +74,11 @@ class TestConstants:
     def test_score_threshold_is_0_75(self):
         assert SCORE_THRESHOLD == 0.75
 
-    def test_prompt_token_cap_is_7000(self):
-        assert PROMPT_TOKEN_CAP == 7_000
+    def test_prompt_token_cap_leaves_generation_headroom(self):
+        # Input cap must leave room for reasoning+generation within the 8,192 window.
+        from api.inference import MAX_NEW_TOKENS
+        assert PROMPT_TOKEN_CAP + MAX_NEW_TOKENS <= 8_192
+        assert PROMPT_TOKEN_CAP >= 4_000  # still enough room for retrieved context
 
 
 # ── repo_id filter ────────────────────────────────────────────────────────────
@@ -441,20 +444,21 @@ class TestEmbeddingModelAlignment:
         )
 
     def test_phase2_retrieval_uses_same_model_name(self):
-        from api.main import _get_embedder
+        # Phase 2's model name lives in _load_embedder; _get_embedder just caches it.
+        from api.main import _load_embedder
         import inspect
-        src = inspect.getsource(_get_embedder)
+        src = inspect.getsource(_load_embedder)
         assert "nomic-ai/nomic-embed-text-v1.5" in src, (
-            "Phase 2 _get_embedder must use the same model as Phase 1"
+            "Phase 2 _load_embedder must use the same model as Phase 1"
         )
 
     def test_both_phases_use_identical_model_string(self):
-        from ingestion.pipeline import _load_embedder
-        from api.main import _get_embedder
+        from ingestion.pipeline import _load_embedder as p1_loader
+        from api.main import _load_embedder as p2_loader
         import inspect, re
         pattern = r'model_name\s*=\s*["\']([^"\']+)["\']'
-        p1 = re.search(pattern, inspect.getsource(_load_embedder))
-        p2 = re.search(pattern, inspect.getsource(_get_embedder))
+        p1 = re.search(pattern, inspect.getsource(p1_loader))
+        p2 = re.search(pattern, inspect.getsource(p2_loader))
         assert p1 and p2, "Both phases must declare a model_name"
         assert p1.group(1) == p2.group(1), (
             f"Model mismatch: Phase 1 uses {p1.group(1)!r}, "

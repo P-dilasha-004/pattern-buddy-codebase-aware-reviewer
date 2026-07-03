@@ -63,11 +63,17 @@ def _comment_url_for(repo_id: str, pr: int) -> str:
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 class TestConstants:
-    def test_max_new_tokens_is_1192(self):
-        assert MAX_NEW_TOKENS == 1_192
+    def test_generation_budget_fits_context_window(self):
+        # Input cap + generation budget must stay within Phi-4-mini's 8,192 window.
+        from api.retrieval import PROMPT_TOKEN_CAP
+        assert PROMPT_TOKEN_CAP + MAX_NEW_TOKENS <= 8_192
 
-    def test_inference_timeout_is_120_seconds(self):
-        assert INFERENCE_TIMEOUT_S == 120.0
+    def test_max_new_tokens_large_enough_for_reasoning_plus_answer(self):
+        # The old 256 truncated the reasoning model mid-<think>; must be generous.
+        assert MAX_NEW_TOKENS >= 1_000
+
+    def test_inference_timeout_is_generous_for_reasoning_model(self):
+        assert INFERENCE_TIMEOUT_S >= 120.0
 
     def test_github_timeout_is_30_seconds(self):
         assert GITHUB_TIMEOUT_S == 30.0
@@ -169,7 +175,8 @@ class TestCallInferenceResponseParsing:
                 return_value=httpx.Response(200, json=_phi_response(content))
             )
             result = await call_inference(PROMPT, PHI_ENDPOINT, PHI_KEY)
-        assert result == content
+        # Output is whitespace-stripped for a clean PR comment.
+        assert result == content.strip()
 
     @pytest.mark.asyncio
     async def test_non_2xx_raises_http_status_error(self):
@@ -211,6 +218,49 @@ class TestCallInferenceResponseParsing:
             )
             with pytest.raises(httpx.ReadTimeout):
                 await call_inference(PROMPT, PHI_ENDPOINT, PHI_KEY, http_timeout=0.01)
+
+
+# ── Reasoning (<think>) stripping ────────────────────────────────────────────
+
+class TestReasoningStripping:
+    @pytest.mark.asyncio
+    async def _run(self, content):
+        with respx.mock() as router:
+            router.post(PHI_ENDPOINT).mock(
+                return_value=httpx.Response(200, json=_phi_response(content))
+            )
+            return await call_inference(PROMPT, PHI_ENDPOINT, PHI_KEY)
+
+    @pytest.mark.asyncio
+    async def test_complete_think_block_removed(self):
+        result = await self._run("<think>reasoning here</think>\n# Review\n\nNo issues.")
+        assert "<think>" not in result and "reasoning here" not in result
+        assert result == "# Review\n\nNo issues."
+
+    @pytest.mark.asyncio
+    async def test_unclosed_think_block_does_not_leak_raw_reasoning(self):
+        # The exact failure seen on the live PR: model truncated mid-<think>, no
+        # closing tag. Must NOT post the raw monologue.
+        raw = "<think>Okay let me reason about this and I ran out of tok"
+        result = await self._run(raw)
+        assert "<think>" not in result
+        assert "let me reason" not in result
+
+    @pytest.mark.asyncio
+    async def test_all_reasoning_no_verdict_falls_back_to_message(self):
+        from api.inference import _TRUNCATED_MSG
+        result = await self._run("<think>only reasoning, cut off before answer")
+        assert result == _TRUNCATED_MSG  # clean message, never blank or raw <think>
+
+    @pytest.mark.asyncio
+    async def test_answer_after_closed_think_survives(self):
+        result = await self._run("<think>thinking</think>Severity: High — SQL injection.")
+        assert result == "Severity: High — SQL injection."
+
+    @pytest.mark.asyncio
+    async def test_plain_answer_without_think_untouched(self):
+        result = await self._run("# Review Summary\n\nLooks good.")
+        assert result == "# Review Summary\n\nLooks good."
 
 
 # ── post_github_comment: request format ──────────────────────────────────────

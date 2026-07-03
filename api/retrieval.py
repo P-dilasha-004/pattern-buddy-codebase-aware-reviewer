@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 COLLECTION      = "global_codebase_memory"
 TOP_K           = 5
 SCORE_THRESHOLD = 0.75
-PROMPT_TOKEN_CAP = 7_000   # ≤7,000 tokens; reserves headroom for generation
+PROMPT_TOKEN_CAP = 6_000   # input cap; leaves 1,500 for reasoning+generation within the 8,192 window (see inference.MAX_NEW_TOKENS)
 
 _ENC = tiktoken.get_encoding("cl100k_base")
 

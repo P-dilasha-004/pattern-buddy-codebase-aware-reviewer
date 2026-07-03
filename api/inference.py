@@ -26,8 +26,14 @@ _PHI_CONTEXT_WINDOW: int = 8_192   # Phi-4-mini-reasoning hard limit
 
 from api.retrieval import PROMPT_TOKEN_CAP  # noqa: E402 — avoids circular at call time
 
-# Generation headroom = context window − input cap; must stay in sync with retrieval.py.
-MAX_NEW_TOKENS: int = 256  # reduced for e2e test — reasoning model generates <think> tokens too
+# Generation budget. This is a CEILING, not a target — the model stops at EOS when
+# done, so a larger cap doesn't slow simple reviews; it just prevents the model
+# from being cut off mid-answer. Phi-4-mini-reasoning spends a big chunk of its
+# output inside a <think> block before writing the review, so a tight cap (the
+# old 256) truncated it while it was still reasoning: no closing </think>, no
+# actual verdict. 1500 leaves room to finish reasoning AND produce the review.
+# Must satisfy PROMPT_TOKEN_CAP + MAX_NEW_TOKENS <= context window (6000 + 1500 < 8192).
+MAX_NEW_TOKENS: int = 1_500
 
 INFERENCE_TIMEOUT_S: float = 180.0   # Phi-4-mini-reasoning can be slow; cap at 3 min
 GITHUB_TIMEOUT_S:    float = 30.0
@@ -42,7 +48,28 @@ FALLBACK_COMMENT = (
 
 # ── Inference ─────────────────────────────────────────────────────────────────
 
-_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+_THINK_CLOSED_RE = re.compile(r"<think>.*?</think>", re.DOTALL)   # complete blocks
+_THINK_OPEN_RE   = re.compile(r"<think>.*\Z", re.DOTALL)          # unclosed (truncated)
+
+_TRUNCATED_MSG = (
+    "_Pattern Buddy could not complete the review — the model ran out of its "
+    "generation budget while reasoning and did not produce a verdict. This "
+    "usually clears on a re-run; if it persists the diff may be too large._"
+)
+
+
+def _strip_reasoning(raw: str) -> str:
+    """
+    Remove the reasoning model's <think> content so only the review reaches the PR.
+
+    Handles both complete <think>…</think> blocks and the truncated case where the
+    model was cut off mid-reasoning and never emitted a closing </think> (the old
+    regex missed that and posted the raw monologue). Any stray tags are cleared too.
+    """
+    cleaned = _THINK_CLOSED_RE.sub("", raw)
+    cleaned = _THINK_OPEN_RE.sub("", cleaned)          # drop an unclosed trailing block
+    cleaned = cleaned.replace("<think>", "").replace("</think>", "")
+    return cleaned.strip()
 
 
 async def call_inference(
@@ -79,7 +106,11 @@ async def call_inference(
     except (KeyError, IndexError) as exc:
         raise ValueError(f"Unexpected inference response shape: {data!r}") from exc
 
-    return _THINK_RE.sub("", raw).lstrip()
+    review = _strip_reasoning(raw)
+    # If the whole response was reasoning (model truncated before a verdict), the
+    # stripped result is empty — post a clear message rather than a blank comment
+    # or raw <think> text.
+    return review or _TRUNCATED_MSG
 
 
 # ── GitHub comment ────────────────────────────────────────────────────────────
