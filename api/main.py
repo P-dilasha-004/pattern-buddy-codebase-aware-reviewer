@@ -55,6 +55,13 @@ _PHI_ENDPOINT:   str = os.environ.get("PHI_ENDPOINT", "")
 _PHI_KEY:        str = os.environ.get("PHI_KEY", "")
 _PHI_DEPLOYMENT: str = os.environ.get("PHI_DEPLOYMENT_NAME", "Phi-4-mini-reasoning")
 
+# repo_ids with an in-flight /admin/reindex. Overlapping reindexes for the same
+# repo interleave delete+upsert and inflate the vector count with duplicates, so
+# a second trigger is rejected while one is running. Sufficient with the single
+# gunicorn worker (-w 1) — the set lives in that one process's event loop, and
+# the check-and-add in the endpoint is atomic (no await between them).
+_reindex_in_progress: set[str] = set()
+
 def _get_qdrant() -> "QdrantClient":
     from qdrant_client import QdrantClient
     return QdrantClient(
@@ -460,10 +467,9 @@ async def _process_reindex(payload: dict[str, Any]) -> None:
             ),
         )
 
-    await asyncio.get_event_loop().run_in_executor(None, _global_delete)
-
     tmp_dir: str | None = None
     try:
+        await asyncio.get_event_loop().run_in_executor(None, _global_delete)
         from pathlib import Path as _Path
 
         loop = asyncio.get_event_loop()
@@ -513,6 +519,7 @@ async def _process_reindex(payload: dict[str, Any]) -> None:
     finally:
         if tmp_dir:
             shutil.rmtree(tmp_dir, ignore_errors=True)
+        _reindex_in_progress.discard(repo_id)  # always release the concurrency guard
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -592,6 +599,15 @@ async def post_admin_reindex(
     _verify_signature(body, x_hub_signature_256)
 
     payload: dict[str, Any] = await request.json()
+    repo_id = payload.get("repo_id", "")
+
+    # Concurrency guard: reject a second reindex for a repo already being rebuilt.
+    if repo_id and repo_id in _reindex_in_progress:
+        logger.info("reindex_rejected_already_running repo=%s", repo_id)
+        return JSONResponse(status_code=409, content={"status": "already_running"})
+    if repo_id:
+        _reindex_in_progress.add(repo_id)
+
     background_tasks.add_task(_process_reindex, payload)
 
     return JSONResponse(status_code=202, content={"status": "accepted"})

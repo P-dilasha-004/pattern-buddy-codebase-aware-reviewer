@@ -55,12 +55,13 @@ PAYLOAD = {"repo_id": "owner/repo", "branch": "main"}
 class TestReindexEndpoint:
     def test_returns_202(self, client):
         body = json.dumps(PAYLOAD).encode()
-        resp = client.post(
-            "/admin/reindex",
-            content=body,
-            headers={"x-hub-signature-256": _sign(body),
-                     "content-type": "application/json"},
-        )
+        with patch("api.main._process_reindex", new_callable=AsyncMock):
+            resp = client.post(
+                "/admin/reindex",
+                content=body,
+                headers={"x-hub-signature-256": _sign(body),
+                         "content-type": "application/json"},
+            )
         assert resp.status_code == 202
 
     def test_background_task_spawned_with_payload(self, client):
@@ -105,6 +106,70 @@ class TestReindexEndpoint:
                          "content-type": "application/json"},
             )
         mock_task.assert_not_called()
+
+    def test_second_reindex_for_same_repo_rejected_with_409(self, client):
+        """Concurrency guard: a repo already being reindexed can't start a second run."""
+        import api.main as m
+        m._reindex_in_progress.add("owner/repo")  # simulate one already in flight
+        try:
+            body = json.dumps(PAYLOAD).encode()  # PAYLOAD repo_id == owner/repo
+            with patch("api.main._process_reindex", new_callable=AsyncMock) as mock_task:
+                resp = client.post(
+                    "/admin/reindex",
+                    content=body,
+                    headers={"x-hub-signature-256": _sign(body),
+                             "content-type": "application/json"},
+                )
+            assert resp.status_code == 409
+            assert resp.json() == {"status": "already_running"}
+            mock_task.assert_not_called()  # no duplicate task spawned
+        finally:
+            m._reindex_in_progress.discard("owner/repo")
+
+    def test_different_repo_not_blocked_by_another_in_flight(self, client):
+        """A reindex for a *different* repo proceeds even while one is running."""
+        import api.main as m
+        m._reindex_in_progress.add("someone-else/other-repo")
+        try:
+            body = json.dumps(PAYLOAD).encode()  # owner/repo — different tenant
+            with patch("api.main._process_reindex", new_callable=AsyncMock) as mock_task:
+                resp = client.post(
+                    "/admin/reindex",
+                    content=body,
+                    headers={"x-hub-signature-256": _sign(body),
+                             "content-type": "application/json"},
+                )
+            assert resp.status_code == 202
+            mock_task.assert_called_once()
+        finally:
+            m._reindex_in_progress.discard("someone-else/other-repo")
+            m._reindex_in_progress.discard("owner/repo")
+
+    @pytest.mark.asyncio
+    async def test_process_reindex_releases_lock_on_completion(self):
+        """After a run finishes, the repo_id must be removed so a re-run can start."""
+        import api.main as m
+        m._reindex_in_progress.add("owner/repo")
+        p = TestProcessReindex._patch_ingest_internals()
+        with patch("api.main._get_qdrant", return_value=MagicMock()), \
+             patch("api.main._get_embedder", return_value=MagicMock()), \
+             patch("api.main._download_zipball", new_callable=AsyncMock, return_value=b"z"), \
+             patch("api.main._extract_zipball", return_value="/tmp/fake_repo"), \
+             p["_walk_repo"], p["_chunk_file"], p["_embed_chunks"], p["_upsert_batch"], \
+             patch("shutil.rmtree"):
+            await m._process_reindex({"repo_id": "owner/repo"})
+        assert "owner/repo" not in m._reindex_in_progress
+
+    @pytest.mark.asyncio
+    async def test_process_reindex_releases_lock_even_on_failure(self):
+        import api.main as m
+        m._reindex_in_progress.add("owner/repo")
+        with patch("api.main._get_qdrant", return_value=MagicMock()), \
+             patch("api.main._download_zipball", new_callable=AsyncMock,
+                   side_effect=RuntimeError("boom")), \
+             patch("shutil.rmtree"):
+            await m._process_reindex({"repo_id": "owner/repo"})
+        assert "owner/repo" not in m._reindex_in_progress
 
 
 # ── _extract_zipball ──────────────────────────────────────────────────────────
