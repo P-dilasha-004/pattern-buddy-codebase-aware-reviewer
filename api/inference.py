@@ -44,9 +44,9 @@ GITHUB_TIMEOUT_S:    float = 30.0
 # afford to wait out a 429/503 rather than posting the error comment. Backoff
 # honours the Retry-After header when present, else exponential (capped).
 _RETRYABLE_STATUS: frozenset[int] = frozenset({429, 503})
-MAX_INFERENCE_RETRIES: int = 5
-_BACKOFF_BASE_S: float = 4.0
-_BACKOFF_CAP_S:  float = 60.0
+MAX_INFERENCE_RETRIES: int = 4
+_BACKOFF_BASE_S: float = 8.0
+_BACKOFF_CAP_S:  float = 90.0
 
 GITHUB_API_BASE = "https://api.github.com"
 
@@ -83,14 +83,32 @@ def _strip_reasoning(raw: str) -> str:
 
 
 def _retry_delay(resp: httpx.Response, attempt: int) -> float:
-    """Seconds to wait before retrying: honour Retry-After, else capped exp backoff."""
+    """
+    Seconds to wait before retrying a rate-limited request.
+
+    Prefer x-ratelimit-reset-requests: it's the true window (60s on this tier).
+    This endpoint's Retry-After is misleadingly short (1s) while the real reset
+    is 60s, so retrying on Retry-After alone just burns the budget inside the
+    same locked minute. Fall back to max(Retry-After, exp backoff) so a short
+    hint can't force uselessly fast retries, then to exp backoff.
+    """
+    exp = min(_BACKOFF_BASE_S * (2 ** attempt), _BACKOFF_CAP_S)
+
+    reset = resp.headers.get("x-ratelimit-reset-requests")
+    if reset:
+        try:
+            return min(float(reset) + 1.0, _BACKOFF_CAP_S)  # +1s so the window has flipped
+        except ValueError:
+            pass
+
     retry_after = resp.headers.get("retry-after")
     if retry_after:
         try:
-            return min(float(retry_after), _BACKOFF_CAP_S)
+            return min(max(float(retry_after), exp), _BACKOFF_CAP_S)
         except ValueError:
-            pass  # HTTP-date form is rare here; fall through to backoff
-    return min(_BACKOFF_BASE_S * (2 ** attempt), _BACKOFF_CAP_S)
+            pass
+
+    return exp
 
 
 async def call_inference(

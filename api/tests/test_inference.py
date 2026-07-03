@@ -230,17 +230,34 @@ class TestRateLimitRetry:
                 await call_inference(PROMPT, PHI_ENDPOINT, PHI_KEY)
 
     @pytest.mark.asyncio
-    async def test_retry_after_header_is_honoured(self, monkeypatch):
+    async def test_ratelimit_reset_window_is_honoured(self, monkeypatch):
+        # The true reset window drives the wait (reset + 1s), not the short Retry-After.
         slept = []
         async def _fake_sleep(s): slept.append(s)
         monkeypatch.setattr("api.inference.asyncio.sleep", _fake_sleep)
         with respx.mock() as router:
             router.post(PHI_ENDPOINT).mock(side_effect=[
-                httpx.Response(429, headers={"retry-after": "7"}),
+                httpx.Response(429, headers={"retry-after": "1",
+                                             "x-ratelimit-reset-requests": "60"}),
                 httpx.Response(200, json=_phi_response(REVIEW_TEXT)),
             ])
             await call_inference(PROMPT, PHI_ENDPOINT, PHI_KEY)
-        assert slept == [7.0]  # waited exactly the server-specified duration
+        assert slept == [61.0]  # 60s window + 1s buffer, NOT the misleading 1s
+
+    @pytest.mark.asyncio
+    async def test_short_retry_after_does_not_force_fast_retry(self, monkeypatch):
+        # With no reset header, a too-short Retry-After is floored by exp backoff.
+        from api.inference import _BACKOFF_BASE_S
+        slept = []
+        async def _fake_sleep(s): slept.append(s)
+        monkeypatch.setattr("api.inference.asyncio.sleep", _fake_sleep)
+        with respx.mock() as router:
+            router.post(PHI_ENDPOINT).mock(side_effect=[
+                httpx.Response(429, headers={"retry-after": "1"}),
+                httpx.Response(200, json=_phi_response(REVIEW_TEXT)),
+            ])
+            await call_inference(PROMPT, PHI_ENDPOINT, PHI_KEY)
+        assert slept[0] >= _BACKOFF_BASE_S  # not 1s
 
     @pytest.mark.asyncio
     async def test_500_not_retried(self, monkeypatch):
