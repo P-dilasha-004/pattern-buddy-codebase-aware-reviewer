@@ -13,6 +13,7 @@ issues namespace in the GitHub API).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 
@@ -37,6 +38,15 @@ MAX_NEW_TOKENS: int = 1_500
 
 INFERENCE_TIMEOUT_S: float = 180.0   # Phi-4-mini-reasoning can be slow; cap at 3 min
 GITHUB_TIMEOUT_S:    float = 30.0
+
+# The Azure AI Foundry serverless endpoint has a tight per-minute rate limit.
+# The review runs in a background task (GitHub already got its 202), so we can
+# afford to wait out a 429/503 rather than posting the error comment. Backoff
+# honours the Retry-After header when present, else exponential (capped).
+_RETRYABLE_STATUS: frozenset[int] = frozenset({429, 503})
+MAX_INFERENCE_RETRIES: int = 5
+_BACKOFF_BASE_S: float = 4.0
+_BACKOFF_CAP_S:  float = 60.0
 
 GITHUB_API_BASE = "https://api.github.com"
 
@@ -72,6 +82,17 @@ def _strip_reasoning(raw: str) -> str:
     return cleaned.strip()
 
 
+def _retry_delay(resp: httpx.Response, attempt: int) -> float:
+    """Seconds to wait before retrying: honour Retry-After, else capped exp backoff."""
+    retry_after = resp.headers.get("retry-after")
+    if retry_after:
+        try:
+            return min(float(retry_after), _BACKOFF_CAP_S)
+        except ValueError:
+            pass  # HTTP-date form is rare here; fall through to backoff
+    return min(_BACKOFF_BASE_S * (2 ** attempt), _BACKOFF_CAP_S)
+
+
 async def call_inference(
     prompt: str,
     phi_endpoint: str,
@@ -84,7 +105,8 @@ async def call_inference(
     serverless endpoint and return the generated review text.
 
     The endpoint uses the OpenAI-compatible chat completions API format.
-    Raises httpx.HTTPStatusError on non-2xx or httpx.TimeoutException on timeout.
+    Retries on 429/503 (rate limit) with backoff; raises httpx.HTTPStatusError
+    on other non-2xx, on the final retry, or httpx.TimeoutException on timeout.
     """
     headers = {
         "Authorization": f"Bearer {phi_key}",
@@ -97,8 +119,18 @@ async def call_inference(
     }
 
     async with httpx.AsyncClient(timeout=http_timeout) as client:
-        resp = await client.post(phi_endpoint, json=body, headers=headers)
-        resp.raise_for_status()
+        for attempt in range(MAX_INFERENCE_RETRIES + 1):
+            resp = await client.post(phi_endpoint, json=body, headers=headers)
+            if resp.status_code in _RETRYABLE_STATUS and attempt < MAX_INFERENCE_RETRIES:
+                delay = _retry_delay(resp, attempt)
+                logger.warning(
+                    "inference_rate_limited status=%s attempt=%d/%d retry_in=%.1fs",
+                    resp.status_code, attempt + 1, MAX_INFERENCE_RETRIES, delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+            resp.raise_for_status()   # 2xx passes; other errors (or final 429) raise
+            break
 
     data = resp.json()
     try:

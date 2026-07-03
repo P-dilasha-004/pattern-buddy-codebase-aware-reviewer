@@ -192,6 +192,67 @@ class TestCallInferenceResponseParsing:
             with pytest.raises(httpx.HTTPStatusError):
                 await call_inference(PROMPT, PHI_ENDPOINT, PHI_KEY)
 
+
+# ── 429 rate-limit retry ──────────────────────────────────────────────────────
+
+class TestRateLimitRetry:
+    @pytest.mark.asyncio
+    async def test_429_then_200_succeeds(self, monkeypatch):
+        # No real waiting in tests.
+        monkeypatch.setattr("api.inference.asyncio.sleep", AsyncMock())
+        with respx.mock() as router:
+            router.post(PHI_ENDPOINT).mock(side_effect=[
+                httpx.Response(429),
+                httpx.Response(200, json=_phi_response(REVIEW_TEXT)),
+            ])
+            result = await call_inference(PROMPT, PHI_ENDPOINT, PHI_KEY)
+        assert result == REVIEW_TEXT
+
+    @pytest.mark.asyncio
+    async def test_multiple_429s_then_success(self, monkeypatch):
+        monkeypatch.setattr("api.inference.asyncio.sleep", AsyncMock())
+        with respx.mock() as router:
+            router.post(PHI_ENDPOINT).mock(side_effect=[
+                httpx.Response(429), httpx.Response(429), httpx.Response(503),
+                httpx.Response(200, json=_phi_response(REVIEW_TEXT)),
+            ])
+            result = await call_inference(PROMPT, PHI_ENDPOINT, PHI_KEY)
+        assert result == REVIEW_TEXT
+
+    @pytest.mark.asyncio
+    async def test_429_exhausts_retries_then_raises(self, monkeypatch):
+        from api.inference import MAX_INFERENCE_RETRIES
+        monkeypatch.setattr("api.inference.asyncio.sleep", AsyncMock())
+        with respx.mock() as router:
+            # Always 429 — more than the retry budget.
+            router.post(PHI_ENDPOINT).mock(return_value=httpx.Response(429))
+            with pytest.raises(httpx.HTTPStatusError):
+                await call_inference(PROMPT, PHI_ENDPOINT, PHI_KEY)
+
+    @pytest.mark.asyncio
+    async def test_retry_after_header_is_honoured(self, monkeypatch):
+        slept = []
+        async def _fake_sleep(s): slept.append(s)
+        monkeypatch.setattr("api.inference.asyncio.sleep", _fake_sleep)
+        with respx.mock() as router:
+            router.post(PHI_ENDPOINT).mock(side_effect=[
+                httpx.Response(429, headers={"retry-after": "7"}),
+                httpx.Response(200, json=_phi_response(REVIEW_TEXT)),
+            ])
+            await call_inference(PROMPT, PHI_ENDPOINT, PHI_KEY)
+        assert slept == [7.0]  # waited exactly the server-specified duration
+
+    @pytest.mark.asyncio
+    async def test_500_not_retried(self, monkeypatch):
+        # Non-retryable errors must fail fast, not spin through the retry budget.
+        sleep_mock = AsyncMock()
+        monkeypatch.setattr("api.inference.asyncio.sleep", sleep_mock)
+        with respx.mock() as router:
+            router.post(PHI_ENDPOINT).mock(return_value=httpx.Response(500))
+            with pytest.raises(httpx.HTTPStatusError):
+                await call_inference(PROMPT, PHI_ENDPOINT, PHI_KEY)
+        sleep_mock.assert_not_called()
+
     @pytest.mark.asyncio
     async def test_malformed_response_missing_choices_raises_value_error(self):
         with respx.mock() as router:
