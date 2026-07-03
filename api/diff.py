@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
+GITHUB_API_BASE = "https://api.github.com"
 FETCH_TIMEOUT_S: float = 30.0          # per-request; hung GitHub blob never blocks forever
 MAX_FILES_THRESHOLD: int = 50          # >50 ingestible files → macro-summary fallback
 
@@ -67,22 +68,39 @@ def _fetchable(changed_files: list[dict]) -> list[dict]:
         f for f in changed_files
         if f.get("status") != "removed"
         and _is_ingestible(f.get("path", ""))
-        and f.get("raw_url")
+        and f.get("path")
     ]
 
 
-async def _fetch_one(client: httpx.AsyncClient, entry: dict, pat: str) -> tuple[str, str]:
+async def _fetch_one(
+    client: httpx.AsyncClient, entry: dict, repo_id: str, ref: str, pat: str
+) -> tuple[str, str]:
     """
-    Fetch a single raw blob from GitHub.
-    PAT is injected on every request to avoid unauthenticated rate limits.
-    Raises on non-2xx or network error — caller handles via return_exceptions.
+    Fetch a single file's raw content via the GitHub Contents API.
+
+    We deliberately do NOT use the pulls/files `raw_url`: GitHub returns it with
+    percent-encoded slashes (e.g. `src%2Fbackend%2Ffile.py`) that 404 for nested
+    paths, and it points at the github.com/raw redirect to raw.githubusercontent.com
+    where httpx drops the Authorization header cross-host — so it silently 404s on
+    private repos. The Contents API with the raw media type takes the path in the
+    URL, keeps auth on a single host, and returns file bytes directly.
+
+    PAT is injected on every request. Raises on non-2xx — caller handles via
+    return_exceptions.
     """
+    path = entry["path"]
+    url = f"{GITHUB_API_BASE}/repos/{repo_id}/contents/{path}"
     resp = await client.get(
-        entry["raw_url"],
-        headers={"Authorization": f"Bearer {pat}"},
+        url,
+        params={"ref": ref},
+        headers={
+            "Authorization": f"Bearer {pat}",
+            "Accept": "application/vnd.github.raw",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
     )
     resp.raise_for_status()
-    return entry["path"], resp.text
+    return path, resp.text
 
 
 # ── Public entry point ────────────────────────────────────────────────────────
@@ -119,10 +137,14 @@ async def extract_and_fetch(
     if not to_fetch:
         return FetchResult()
 
+    repo_id = payload.get("repo_id", "")
+    # /review sends head_sha; /sync sends commit_hash. Fall back to HEAD.
+    ref = payload.get("head_sha") or payload.get("commit_hash") or "HEAD"
+
     # ── Concurrent fetch ──────────────────────────────────────────────────────
     async with httpx.AsyncClient(timeout=http_timeout, follow_redirects=True) as client:
         results = await asyncio.gather(
-            *[_fetch_one(client, f, pat) for f in to_fetch],
+            *[_fetch_one(client, f, repo_id, ref, pat) for f in to_fetch],
             return_exceptions=True,
         )
 

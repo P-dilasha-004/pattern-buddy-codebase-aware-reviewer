@@ -27,7 +27,10 @@ from api.diff import (
 )
 
 PAT = "ghp_test_token"
-BASE_URL = "https://raw.githubusercontent.com/owner/repo/abc123"
+# The code fetches via the GitHub Contents API (raw media type), not the
+# pulls/files raw_url. Mocks register the Contents URL the code actually hits;
+# respx ignores the ?ref= query param when it isn't part of the route pattern.
+CONTENTS_BASE = "https://api.github.com/repos/owner/repo/contents"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -36,7 +39,7 @@ def _file(path: str, status: str = "modified", content: str = "# content") -> di
     return {
         "path": path,
         "status": status,
-        "raw_url": f"{BASE_URL}/{path}",
+        "raw_url": f"{CONTENTS_BASE}/{path}",  # Contents API URL the code requests
         "_content": content,   # used by respx mock only, not sent to server
     }
 
@@ -102,9 +105,17 @@ class TestFetchable:
         files = [_file("src/auth.py", status="added")]
         assert len(_fetchable(files)) == 1
 
-    def test_file_without_raw_url_excluded(self):
-        files = [{"path": "src/auth.py", "status": "modified", "raw_url": None}]
+    def test_file_without_path_excluded(self):
+        # raw_url is no longer used (Contents API keys off path); a missing/empty
+        # path is what makes an entry unfetchable.
+        files = [{"status": "modified", "raw_url": None}]
         assert _fetchable(files) == []
+
+    def test_file_with_path_but_no_raw_url_still_fetchable(self):
+        # Regression: the old code required raw_url and dropped otherwise-valid
+        # files. The Contents API only needs the path.
+        files = [{"path": "src/auth.py", "status": "modified"}]
+        assert len(_fetchable(files)) == 1
 
     def test_non_ingestible_extension_excluded(self):
         files = [_file("logo.png")]
@@ -485,24 +496,20 @@ class TestActualConcurrency:
 class TestDuplicatePaths:
     @pytest.mark.asyncio
     async def test_duplicate_paths_last_write_wins(self):
-        """If the same path appears twice, the second entry overwrites the first."""
-        f1 = {"path": "src/auth.py", "status": "modified",
-              "raw_url": f"{BASE_URL}/src/auth.py?v=1", "_content": "version_one"}
-        f2 = {"path": "src/auth.py", "status": "modified",
-              "raw_url": f"{BASE_URL}/src/auth.py?v=2", "_content": "version_two"}
-
+        """Duplicate path entries collapse to a single result file (Contents API
+        keys off path, so both requests hit the same URL)."""
+        dup = {"path": "src/auth.py", "status": "modified"}
         with respx.mock() as router:
-            router.get(f1["raw_url"]).mock(return_value=httpx.Response(200, text="version_one"))
-            router.get(f2["raw_url"]).mock(return_value=httpx.Response(200, text="version_two"))
+            router.get(f"{CONTENTS_BASE}/src/auth.py").mock(
+                return_value=httpx.Response(200, text="the_content")
+            )
             payload = {
                 "repo_id": "owner/repo", "pr_number": 1, "head_sha": "abc",
-                "changed_files": [
-                    {k: v for k, v in f.items() if k != "_content"} for f in [f1, f2]
-                ],
+                "changed_files": [dict(dup), dict(dup)],
             }
             result = await extract_and_fetch(payload, PAT)
 
-        assert "src/auth.py" in result.files
+        assert result.files == {"src/auth.py": "the_content"}  # one entry, not two
         assert len(result.files) == 1  # deduplicated to one key
 
     @pytest.mark.asyncio
@@ -578,14 +585,10 @@ class TestCaseSensitivity:
 
     @pytest.mark.asyncio
     async def test_uppercase_py_file_fetched(self):
-        f = {"path": "src/Module.PY", "status": "modified",
-             "raw_url": f"{BASE_URL}/src/Module.PY"}
+        f = _file("src/Module.PY")
         with respx.mock() as router:
             router.get(f["raw_url"]).mock(return_value=httpx.Response(200, text="x = 1"))
-            result = await extract_and_fetch(
-                {"repo_id": "r", "pr_number": 1, "head_sha": "a", "changed_files": [f]},
-                PAT,
-            )
+            result = await extract_and_fetch(_payload(f), PAT)
         assert "src/Module.PY" in result.files
 
     @pytest.mark.parametrize("name", [
