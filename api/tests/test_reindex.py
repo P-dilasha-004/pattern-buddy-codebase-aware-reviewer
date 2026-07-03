@@ -163,6 +163,7 @@ class TestProcessReindex:
         fake_client = MagicMock()
 
         with patch("api.main._get_qdrant", return_value=fake_client), \
+             patch("api.main._get_embedder", return_value=MagicMock()), \
              patch("api.main._download_zipball", new_callable=AsyncMock,
                    return_value=b"zipbytes"), \
              patch("api.main._extract_zipball", return_value="/tmp/fake_repo"), \
@@ -183,8 +184,10 @@ class TestProcessReindex:
     async def test_ingest_repository_called_with_extracted_path_and_repo_id(self):
         import api.main as m
         fake_client = MagicMock()
+        fake_embedder = MagicMock()
 
         with patch("api.main._get_qdrant", return_value=fake_client), \
+             patch("api.main._get_embedder", return_value=fake_embedder), \
              patch("api.main._download_zipball", new_callable=AsyncMock,
                    return_value=b"zipbytes"), \
              patch("api.main._extract_zipball", return_value="/tmp/fake_repo_root") as mock_extract, \
@@ -203,9 +206,35 @@ class TestProcessReindex:
         assert kwargs["qdrant_client"] is fake_client
 
     @pytest.mark.asyncio
+    async def test_ingest_repository_reuses_shared_embedder_not_a_fresh_one(self):
+        """
+        Regression test: ingest_repository must be called with the API's
+        cached singleton embedder, not left to load its own independent
+        copy of the ~1GB model. Loading a second copy on top of whatever
+        /review or /sync already cached is what caused the OOM kills.
+        """
+        import api.main as m
+        fake_embedder = MagicMock()
+
+        with patch("api.main._get_qdrant", return_value=MagicMock()), \
+             patch("api.main._get_embedder", return_value=fake_embedder) as mock_get_embedder, \
+             patch("api.main._download_zipball", new_callable=AsyncMock,
+                   return_value=b"zipbytes"), \
+             patch("api.main._extract_zipball", return_value="/tmp/fake_repo"), \
+             patch("api.main.ingest_repository",
+                   return_value={"files_processed": 1, "chunks_upserted": 1, "files_skipped": 0}) as mock_ingest, \
+             patch("shutil.rmtree"):
+            await m._process_reindex({"repo_id": "owner/repo"})
+
+        mock_get_embedder.assert_called_once()
+        _, kwargs = mock_ingest.call_args
+        assert kwargs["embedder"] is fake_embedder
+
+    @pytest.mark.asyncio
     async def test_temp_dir_cleaned_up_after_success(self):
         import api.main as m
         with patch("api.main._get_qdrant", return_value=MagicMock()), \
+             patch("api.main._get_embedder", return_value=MagicMock()), \
              patch("api.main._download_zipball", new_callable=AsyncMock,
                    return_value=b"zipbytes"), \
              patch("api.main._extract_zipball", return_value="/tmp/fake_repo"), \
@@ -221,6 +250,7 @@ class TestProcessReindex:
     async def test_temp_dir_cleaned_up_even_when_ingestion_raises(self):
         import api.main as m
         with patch("api.main._get_qdrant", return_value=MagicMock()), \
+             patch("api.main._get_embedder", return_value=MagicMock()), \
              patch("api.main._download_zipball", new_callable=AsyncMock,
                    return_value=b"zipbytes"), \
              patch("api.main._extract_zipball", return_value="/tmp/fake_repo"), \
@@ -249,6 +279,7 @@ class TestProcessReindex:
     async def test_defaults_to_main_branch_when_omitted(self):
         import api.main as m
         with patch("api.main._get_qdrant", return_value=MagicMock()), \
+             patch("api.main._get_embedder", return_value=MagicMock()), \
              patch("api.main._download_zipball", new_callable=AsyncMock,
                    return_value=b"zipbytes") as mock_dl, \
              patch("api.main._extract_zipball", return_value="/tmp/fake_repo"), \

@@ -465,6 +465,7 @@ async def _process_reindex(payload: dict[str, Any]) -> None:
                 repo_id=repo_id,
                 commit_hash=payload.get("commit_hash", "weekly-rebuild"),
                 qdrant_client=client,
+                embedder=_get_embedder(),
             )
 
         result = await asyncio.get_event_loop().run_in_executor(None, _reingest)

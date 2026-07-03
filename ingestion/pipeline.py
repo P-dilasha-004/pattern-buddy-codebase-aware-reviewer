@@ -164,9 +164,16 @@ def _upsert_batch(client, chunks, vectors, repo_id, commit_hash):
     client.upsert(collection_name=QDRANT_COLLECTION, points=points)
 
 
-def ingest_repository(repo_path, repo_id, commit_hash, qdrant_client, batch_size=64):
+def ingest_repository(repo_path, repo_id, commit_hash, qdrant_client, batch_size=64, embedder=None):
+    """
+    embedder: pass an already-loaded TextEmbedding instance to reuse a shared
+    singleton (e.g. the API's cached embedder) instead of loading a second,
+    independent ~1GB copy of the model. Only loads its own when omitted,
+    which is what the standalone run_ingestion.py CLI relies on.
+    """
     repo_path = Path(repo_path)
-    embedder = _load_embedder()
+    if embedder is None:
+        embedder = _load_embedder()
     files = _walk_repo(repo_path)
     logger.info("Found %d ingestible files in %s", len(files), repo_path)
 
