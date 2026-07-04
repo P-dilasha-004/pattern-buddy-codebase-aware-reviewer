@@ -62,6 +62,14 @@ _PHI_DEPLOYMENT: str = os.environ.get("PHI_DEPLOYMENT_NAME", "Phi-4-mini-reasoni
 # the check-and-add in the endpoint is atomic (no await between them).
 _reindex_in_progress: set[str] = set()
 
+# repo_ids with an in-flight /review. The Phi endpoint is rate-limited to 1
+# request / 60s, and each review (plus its retries) consumes that budget, so
+# overlapping reviews for a repo — from rapid open/close/reopen/push on a PR —
+# starve each other and all fail with the fallback comment. Serialize reviews
+# per repo: a second trigger while one is running is rejected (workflow-level
+# concurrency already cancels superseded runs, so we don't lose the latest).
+_review_in_progress: set[str] = set()
+
 def _get_qdrant() -> "QdrantClient":
     from qdrant_client import QdrantClient
     return QdrantClient(
@@ -306,6 +314,7 @@ async def _process_review(payload: dict[str, Any]) -> None:
     finally:
         end_to_end_latency_ms = (time.monotonic() - t_pipeline_start) * 1000
         _emit_system_metrics(trace_id, status, end_to_end_latency_ms, inference_latency_ms)
+        _review_in_progress.discard(repo_id)  # always release the concurrency guard
 
 
 async def _process_sync(payload: dict[str, Any]) -> None:
@@ -543,7 +552,19 @@ async def post_review(
     _verify_signature(body, x_hub_signature_256)
 
     payload: dict[str, Any] = await request.json()
-    payload["trace_id"] = _new_trace_id(payload.get("repo_id", ""), payload.get("pr_number", 0))
+    repo_id = payload.get("repo_id", "")
+
+    # Concurrency guard: serialize reviews per repo so overlapping triggers don't
+    # cannibalise the rate-limited inference endpoint. Check-and-add is atomic
+    # (no await between); the background task releases it in its finally.
+    if repo_id and repo_id in _review_in_progress:
+        logger.info("review_rejected_already_running repo=%s pr=%s",
+                    repo_id, payload.get("pr_number"))
+        return JSONResponse(status_code=409, content={"status": "already_running"})
+    if repo_id:
+        _review_in_progress.add(repo_id)
+
+    payload["trace_id"] = _new_trace_id(repo_id, payload.get("pr_number", 0))
     background_tasks.add_task(_process_review, payload)
 
     return JSONResponse(status_code=202, content={"status": "accepted"})

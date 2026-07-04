@@ -108,6 +108,55 @@ class TestValidRequest:
         assert called_with["head_sha"] == "bbb222"
 
 
+class TestReviewConcurrencyGuard:
+    def test_second_review_same_repo_rejected_409(self, client):
+        import api.main as m
+        m._review_in_progress.add("owner/repo")  # simulate one already running
+        try:
+            body = json.dumps(SAMPLE_PAYLOAD).encode()
+            with patch("api.main._process_review", new_callable=AsyncMock) as mock_task:
+                resp = client.post(
+                    "/review",
+                    content=body,
+                    headers={"x-hub-signature-256": _sign(body),
+                             "content-type": "application/json"},
+                )
+            assert resp.status_code == 409
+            assert resp.json() == {"status": "already_running"}
+            mock_task.assert_not_called()  # no overlapping review spawned
+        finally:
+            m._review_in_progress.discard("owner/repo")
+
+    def test_different_repo_not_blocked(self, client):
+        import api.main as m
+        m._review_in_progress.add("someone-else/repo")
+        try:
+            body = json.dumps(SAMPLE_PAYLOAD).encode()  # owner/repo
+            with patch("api.main._process_review", new_callable=AsyncMock) as mock_task:
+                resp = client.post(
+                    "/review",
+                    content=body,
+                    headers={"x-hub-signature-256": _sign(body),
+                             "content-type": "application/json"},
+                )
+            assert resp.status_code == 202
+            mock_task.assert_called_once()
+        finally:
+            m._review_in_progress.discard("someone-else/repo")
+            m._review_in_progress.discard("owner/repo")
+
+    @pytest.mark.asyncio
+    async def test_process_review_releases_lock(self):
+        import api.main as m
+        m._review_in_progress.add("owner/repo")
+        with patch("api.main.extract_and_fetch", new_callable=AsyncMock,
+                   side_effect=RuntimeError("boom")), \
+             patch("api.main.post_github_comment", new_callable=AsyncMock):
+            await m._process_review({"repo_id": "owner/repo", "pr_number": 42,
+                                     "trace_id": "t"})
+        assert "owner/repo" not in m._review_in_progress
+
+
 # ── Security gate — missing / invalid signature ───────────────────────────────
 
 class TestSignatureValidation:
