@@ -28,7 +28,13 @@ logger = logging.getLogger(__name__)
 
 COLLECTION      = "global_codebase_memory"
 TOP_K           = 5
-SCORE_THRESHOLD = 0.75
+# Empirically tuned for nomic-embed-text-v1.5 on code. planning.md's 0.75 was too
+# aggressive: relevant repo chunks for a code diff score ~0.62–0.72 with this model,
+# so 0.75 rejected ALL of them → 0 chunks retrieved → reviews ran diff-only (not
+# codebase-aware) despite the repo being ingested. Measured noise floor (unrelated
+# text vs. this repo) is ~0.47–0.50, so 0.60 sits in the gap: keeps relevant
+# context, filters noise.
+SCORE_THRESHOLD = 0.60
 PROMPT_TOKEN_CAP = 6_000   # input cap; leaves 1,500 for reasoning+generation within the 8,192 window (see inference.MAX_NEW_TOKENS)
 
 _ENC = tiktoken.get_encoding("cl100k_base")

@@ -71,8 +71,10 @@ class TestConstants:
     def test_top_k_is_5(self):
         assert TOP_K == 5
 
-    def test_score_threshold_is_0_75(self):
-        assert SCORE_THRESHOLD == 0.75
+    def test_score_threshold_tuned_for_nomic_on_code(self):
+        # 0.75 (planning.md) filtered out all real context; nomic scores relevant
+        # code chunks ~0.62-0.72, noise ~0.47-0.50. Must sit in that gap.
+        assert 0.50 < SCORE_THRESHOLD < 0.72
 
     def test_prompt_token_cap_leaves_generation_headroom(self):
         # Input cap + generation must fit gemini-2.5-flash's ~1M-token window.
