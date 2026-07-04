@@ -135,6 +135,12 @@ async def call_inference(
         "model": phi_model,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": MAX_NEW_TOKENS,
+        # gemini-2.5-flash is a thinking model whose hidden reasoning tokens count
+        # against max_tokens and vary a lot by input — on dense files they ate the
+        # budget and truncated the review mid-finding. Disable thinking so the full
+        # budget goes to the visible review (flash is plenty capable for this task,
+        # and output is now complete + predictable). Ignored by non-Gemini backends.
+        "reasoning_effort": "none",
     }
 
     async with httpx.AsyncClient(timeout=http_timeout) as client:
