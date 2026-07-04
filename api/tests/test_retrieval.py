@@ -75,9 +75,9 @@ class TestConstants:
         assert SCORE_THRESHOLD == 0.75
 
     def test_prompt_token_cap_leaves_generation_headroom(self):
-        # Input cap must leave room for reasoning+generation within the 8,192 window.
+        # Input cap + generation must fit gemini-2.5-flash's ~1M-token window.
         from api.inference import MAX_NEW_TOKENS
-        assert PROMPT_TOKEN_CAP + MAX_NEW_TOKENS <= 8_192
+        assert PROMPT_TOKEN_CAP + MAX_NEW_TOKENS <= 1_000_000
         assert PROMPT_TOKEN_CAP >= 4_000  # still enough room for retrieved context
 
 

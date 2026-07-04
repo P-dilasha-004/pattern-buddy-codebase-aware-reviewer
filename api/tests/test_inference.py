@@ -63,14 +63,16 @@ def _comment_url_for(repo_id: str, pr: int) -> str:
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 class TestConstants:
-    def test_generation_budget_fits_context_window(self):
-        # Input cap + generation budget must stay within Phi-4-mini's 8,192 window.
+    def test_generation_budget_fits_gemini_context_window(self):
+        # gemini-2.5-flash has a ~1M-token window; input cap + generation budget
+        # must fit it (the old Phi 8,192 constraint no longer applies).
         from api.retrieval import PROMPT_TOKEN_CAP
-        assert PROMPT_TOKEN_CAP + MAX_NEW_TOKENS <= 8_192
+        assert PROMPT_TOKEN_CAP + MAX_NEW_TOKENS <= 1_000_000
 
-    def test_max_new_tokens_large_enough_for_reasoning_plus_answer(self):
-        # The old 256 truncated the reasoning model mid-<think>; must be generous.
-        assert MAX_NEW_TOKENS >= 1_000
+    def test_max_new_tokens_large_enough_for_thinking_plus_answer(self):
+        # A thinking model spends hidden tokens before the answer; the budget must
+        # be generous enough to leave room for a full review (old 1500 truncated).
+        assert MAX_NEW_TOKENS >= 3_000
 
     def test_inference_timeout_is_generous_for_reasoning_model(self):
         assert INFERENCE_TIMEOUT_S >= 120.0

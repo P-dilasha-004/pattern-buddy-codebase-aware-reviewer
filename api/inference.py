@@ -27,14 +27,15 @@ _PHI_CONTEXT_WINDOW: int = 8_192   # Phi-4-mini-reasoning hard limit
 
 from api.retrieval import PROMPT_TOKEN_CAP  # noqa: E402 — avoids circular at call time
 
-# Generation budget. This is a CEILING, not a target — the model stops at EOS when
-# done, so a larger cap doesn't slow simple reviews; it just prevents the model
-# from being cut off mid-answer. Phi-4-mini-reasoning spends a big chunk of its
-# output inside a <think> block before writing the review, so a tight cap (the
-# old 256) truncated it while it was still reasoning: no closing </think>, no
-# actual verdict. 1500 leaves room to finish reasoning AND produce the review.
-# Must satisfy PROMPT_TOKEN_CAP + MAX_NEW_TOKENS <= context window (6000 + 1500 < 8192).
-MAX_NEW_TOKENS: int = 1_500
+# Generation budget. This is a CEILING, not a target — the model stops when done,
+# so a larger cap doesn't slow simple reviews; it just prevents truncation.
+# gemini-2.5-flash is a thinking model: it spends hidden reasoning tokens (which
+# count against this budget) before the visible answer, so a tight cap (the old
+# 1500, tuned for Phi's 8,192 window) left too little for the review and cut it
+# off mid-sentence. Gemini's context window is ~1M tokens, so the old
+# PROMPT_TOKEN_CAP + MAX_NEW_TOKENS <= 8192 constraint no longer applies; 4000
+# leaves ample room for thinking AND a multi-finding review.
+MAX_NEW_TOKENS: int = 4_000
 
 INFERENCE_TIMEOUT_S: float = 180.0   # Phi-4-mini-reasoning can be slow; cap at 3 min
 GITHUB_TIMEOUT_S:    float = 30.0
