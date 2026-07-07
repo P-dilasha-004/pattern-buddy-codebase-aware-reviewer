@@ -27,9 +27,10 @@ from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from qdrant_client import models as qdrant_models
 
-from api.diff import extract_and_fetch
+from api.diff import extract_and_fetch, fetch_pr_files
 from api.retrieval import retrieve_and_assemble, build_macro_prompt
 from api.inference import call_inference, post_github_comment, FALLBACK_COMMENT
+from api.github_app import get_installation_token, list_installations, list_installation_repos
 from ingestion.pipeline import (
     QDRANT_COLLECTION,
     ingest_repository,
@@ -50,7 +51,6 @@ app = FastAPI(title="Pattern Buddy", version="2.0.0")
 # ── Security ──────────────────────────────────────────────────────────────────
 
 _WEBHOOK_SECRET: str = os.environ.get("WEBHOOK_SECRET", "")
-_PAT:            str = os.environ.get("PAT", "")
 _PHI_ENDPOINT:   str = os.environ.get("PHI_ENDPOINT", "")
 _PHI_KEY:        str = os.environ.get("PHI_KEY", "")
 _PHI_DEPLOYMENT: str = os.environ.get("PHI_DEPLOYMENT_NAME", "Phi-4-mini-reasoning")
@@ -62,13 +62,56 @@ _PHI_DEPLOYMENT: str = os.environ.get("PHI_DEPLOYMENT_NAME", "Phi-4-mini-reasoni
 # the check-and-add in the endpoint is atomic (no await between them).
 _reindex_in_progress: set[str] = set()
 
-# repo_ids with an in-flight /review. The Phi endpoint is rate-limited to 1
-# request / 60s, and each review (plus its retries) consumes that budget, so
-# overlapping reviews for a repo — from rapid open/close/reopen/push on a PR —
-# starve each other and all fail with the fallback comment. Serialize reviews
-# per repo: a second trigger while one is running is rejected (workflow-level
-# concurrency already cancels superseded runs, so we don't lose the latest).
+# repo_ids with an in-flight review. The inference endpoint is rate-limited,
+# and each review (plus its retries) consumes that budget, so overlapping
+# reviews for a repo — from rapid open/synchronize pushes on a PR — starve
+# each other and all fail with the fallback comment. Serialize reviews per
+# repo: a second trigger while one is running is rejected with 409. Unlike
+# the old Actions-triggered design (which had a workflow-level concurrency
+# group that auto-cancelled superseded runs), a GitHub App webhook delivery
+# that gets a 409 is simply dropped — a rapid double-push can leave the
+# review pinned to the first push's SHA rather than the latest. Acceptable
+# for now; revisit if this proves to matter in practice.
 _review_in_progress: set[str] = set()
+
+# repo_id -> installation_id, populated opportunistically from every incoming
+# GitHub App webhook (every payload carries installation.id). Lets a later
+# caller with no live webhook context (e.g. a manual /admin/reindex trigger
+# for a known repo) skip walking every installation to find the right one.
+_installation_id_by_repo: dict[str, int] = {}
+
+
+async def _resolve_installation_id(repo_id: str) -> int:
+    """
+    Which installation covers repo_id. Prefers the opportunistic cache;
+    falls back to walking the App's own installations (JWT-authenticated)
+    for callers with no live webhook context.
+    """
+    if repo_id in _installation_id_by_repo:
+        return _installation_id_by_repo[repo_id]
+    for installation in await list_installations():
+        installation_id = installation["id"]
+        if repo_id in await list_installation_repos(installation_id):
+            _installation_id_by_repo[repo_id] = installation_id
+            return installation_id
+    raise ValueError(f"no GitHub App installation found for repo_id={repo_id!r}")
+
+
+async def _resolve_token(payload: dict[str, Any]) -> str:
+    """
+    Resolve a bearer token for whichever repo this payload concerns. Replaces
+    the old static PAT — every GitHub call is now authenticated as the
+    specific installation that covers the target repo, auto-scoped by GitHub
+    at install time rather than manually scoped on github.com.
+    """
+    repo_id = payload.get("repo_id", "")
+    installation_id = payload.get("installation_id")
+    if installation_id is not None:
+        _installation_id_by_repo[repo_id] = installation_id
+    else:
+        installation_id = await _resolve_installation_id(repo_id)
+    return await get_installation_token(installation_id)
+
 
 def _get_qdrant() -> "QdrantClient":
     from qdrant_client import QdrantClient
@@ -259,11 +302,14 @@ async def _process_review(payload: dict[str, Any]) -> None:
     t_pipeline_start = time.monotonic()
     inference_latency_ms: float | None = None
     status = "success"
+    token: str | None = None
 
     try:
+        token = await _resolve_token(payload)
+
         # Task 2.2 — diff extraction + concurrent file fetch
         with _stage_timer(trace_id, "diff_fetch") as ctx:
-            fetch_result = await extract_and_fetch(payload, pat=_PAT)
+            fetch_result = await extract_and_fetch(payload, pat=token)
             ctx["metadata"] = {
                 "files_fetched": len(fetch_result.files),
                 "fallback": fetch_result.fallback,
@@ -297,7 +343,7 @@ async def _process_review(payload: dict[str, Any]) -> None:
         logger.info("inference_complete repo=%s pr=%s chars=%d", repo_id, pr_number, len(review))
 
         # Task 2.4 — GitHub callback
-        await post_github_comment(repo_id, pr_number, review, _PAT)
+        await post_github_comment(repo_id, pr_number, review, token)
         logger.info("review_complete repo=%s pr=%s trace_id=%s", repo_id, pr_number, trace_id)
 
     except Exception as exc:
@@ -306,10 +352,13 @@ async def _process_review(payload: dict[str, Any]) -> None:
             "review_failed repo=%s pr=%s trace_id=%s error=%s",
             repo_id, pr_number, trace_id, exc, exc_info=True,
         )
-        try:
-            await post_github_comment(repo_id, pr_number, FALLBACK_COMMENT, _PAT)
-        except Exception as cb_exc:
-            logger.error("fallback_comment_failed repo=%s pr=%s error=%s", repo_id, pr_number, cb_exc)
+        if token:
+            try:
+                await post_github_comment(repo_id, pr_number, FALLBACK_COMMENT, token)
+            except Exception as cb_exc:
+                logger.error("fallback_comment_failed repo=%s pr=%s error=%s", repo_id, pr_number, cb_exc)
+        else:
+            logger.error("fallback_comment_skipped repo=%s pr=%s reason=no_token", repo_id, pr_number)
 
     finally:
         end_to_end_latency_ms = (time.monotonic() - t_pipeline_start) * 1000
@@ -356,6 +405,7 @@ async def _process_sync(payload: dict[str, Any]) -> None:
             repo_id, len(changed_files) - len(valid_entries),
         )
 
+    token = await _resolve_token(payload)
     client = _get_qdrant()
 
     # Blind delete — every changed/deleted file loses its stale vectors before re-ingestion.
@@ -375,7 +425,7 @@ async def _process_sync(payload: dict[str, Any]) -> None:
 
     await asyncio.get_event_loop().run_in_executor(None, _delete_all)
 
-    fetch_result = await extract_and_fetch({**payload, "changed_files": valid_entries}, pat=_PAT)
+    fetch_result = await extract_and_fetch({**payload, "changed_files": valid_entries}, pat=token)
 
     if fetch_result.fallback:
         logger.warning("sync_fetch_skipped repo=%s reason=too_many_files", repo_id)
@@ -484,8 +534,9 @@ async def _process_reindex(payload: dict[str, Any]) -> None:
         loop = asyncio.get_event_loop()
         commit_hash   = payload.get("commit_hash", "weekly-rebuild")
         embedder      = _get_embedder()
+        token         = await _resolve_token(payload)
 
-        zip_bytes = await _download_zipball(repo_id, branch, _PAT)
+        zip_bytes = await _download_zipball(repo_id, branch, token)
         tmp_dir = tempfile.mkdtemp(prefix="pattern_buddy_reindex_")
         repo_root = _extract_zipball(zip_bytes, tmp_dir)
 
@@ -533,71 +584,124 @@ async def _process_reindex(payload: dict[str, Any]) -> None:
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
-@app.post("/review", status_code=202)
-async def post_review(
+def _full_names(entries: list[dict]) -> list[str]:
+    """repo full_name ("owner/repo") strings out of a GitHub webhook's repo list."""
+    return [e["full_name"] for e in entries if e.get("full_name")]
+
+
+def _trigger_reindex(repo_id: str, installation_id: int, background_tasks: BackgroundTasks) -> None:
+    """
+    Kick off auto-ingestion for a newly accessible repo (installation created
+    or installation_repositories added) — this is what lets "click Install"
+    replace the old manual /admin/reindex onboarding step. Reuses the same
+    concurrency guard /admin/reindex uses; a repo already being (re)indexed
+    is skipped, not queued.
+    """
+    _installation_id_by_repo[repo_id] = installation_id
+    if repo_id in _reindex_in_progress:
+        logger.info("reindex_skipped_already_running repo=%s", repo_id)
+        return
+    _reindex_in_progress.add(repo_id)
+    background_tasks.add_task(
+        _process_reindex,
+        {"repo_id": repo_id, "branch": "main", "installation_id": installation_id},
+    )
+
+
+@app.post("/webhook", status_code=202)
+async def post_webhook(
     request: Request,
     background_tasks: BackgroundTasks,
     x_hub_signature_256: str | None = Header(default=None),
+    x_github_event: str | None = Header(default=None),
 ) -> JSONResponse:
     """
-    Receive a PR trigger from the GitHub Actions workflow.
+    Single entry point for every GitHub App webhook event.
 
-    Security gate: validates HMAC-SHA256 signature before any processing.
-    Returns 202 immediately; all orchestration runs in the background.
+    GitHub delivers all event types to one URL — X-GitHub-Event, not the
+    payload shape, says what happened. Replaces the old /review and /sync,
+    which depended on a GitHub Actions workflow living in the target repo to
+    build a custom payload; this endpoint consumes GitHub's native webhook
+    payloads directly, so target repos need zero workflow files — installing
+    the App is the entire onboarding flow.
 
-    Task 5.1: the trace_id is generated here, at webhook ingress, so it
-    covers the full pipeline from the moment the request is accepted.
-    """
-    body = await request.body()
-    _verify_signature(body, x_hub_signature_256)
-
-    payload: dict[str, Any] = await request.json()
-    repo_id = payload.get("repo_id", "")
-
-    # Concurrency guard: serialize reviews per repo so overlapping triggers don't
-    # cannibalise the rate-limited inference endpoint. Check-and-add is atomic
-    # (no await between); the background task releases it in its finally.
-    if repo_id and repo_id in _review_in_progress:
-        logger.info("review_rejected_already_running repo=%s pr=%s",
-                    repo_id, payload.get("pr_number"))
-        return JSONResponse(status_code=409, content={"status": "already_running"})
-    if repo_id:
-        _review_in_progress.add(repo_id)
-
-    payload["trace_id"] = _new_trace_id(repo_id, payload.get("pr_number", 0))
-    background_tasks.add_task(_process_review, payload)
-
-    return JSONResponse(status_code=202, content={"status": "accepted"})
-
-
-@app.post("/sync", status_code=202)
-async def post_sync(
-    request: Request,
-    background_tasks: BackgroundTasks,
-    x_hub_signature_256: str | None = Header(default=None),
-) -> JSONResponse:
-    """
-    Receive a merge trigger from the GitHub Actions workflow (Task 4.1).
-
-    Security gate: validates HMAC-SHA256 signature before any processing.
-    Only merged PRs (action == "closed" and merged == true) proceed to the
-    background sync task; closed-but-unmerged (abandoned) PRs are
-    acknowledged and dropped without touching Qdrant.
+    Security gate: validates HMAC-SHA256 signature (against the App's single
+    webhook secret) before any processing.
     """
     body = await request.body()
     _verify_signature(body, x_hub_signature_256)
 
     payload: dict[str, Any] = await request.json()
 
-    if payload.get("action") != "closed" or not payload.get("merged"):
-        logger.info(
-            "sync_skipped repo=%s action=%s merged=%s",
-            payload.get("repo_id"), payload.get("action"), payload.get("merged"),
-        )
+    installation = payload.get("installation") or {}
+    installation_id = installation.get("id")
+    repo_id = (payload.get("repository") or {}).get("full_name", "")
+    if repo_id and installation_id is not None:
+        _installation_id_by_repo[repo_id] = installation_id
+
+    if x_github_event == "ping":
+        # GitHub sends this when the webhook is first configured, to verify liveness.
+        return JSONResponse(status_code=200, content={"status": "pong"})
+
+    if x_github_event == "installation":
+        if payload.get("action") == "created" and installation_id is not None:
+            for repo in _full_names(payload.get("repositories", [])):
+                _trigger_reindex(repo, installation_id, background_tasks)
+        return JSONResponse(status_code=202, content={"status": "accepted"})
+
+    if x_github_event == "installation_repositories":
+        if payload.get("action") == "added" and installation_id is not None:
+            for repo in _full_names(payload.get("repositories_added", [])):
+                _trigger_reindex(repo, installation_id, background_tasks)
+        return JSONResponse(status_code=202, content={"status": "accepted"})
+
+    if x_github_event == "pull_request":
+        if not repo_id or installation_id is None:
+            return JSONResponse(status_code=202, content={"status": "ignored"})
+
+        action = payload.get("action")
+        pr = payload.get("pull_request") or {}
+        pr_number = payload.get("number")
+
+        if action in ("opened", "synchronize") and pr_number:
+            # Concurrency guard: serialize reviews per repo so overlapping triggers
+            # don't cannibalise the rate-limited inference endpoint.
+            if repo_id in _review_in_progress:
+                logger.info("review_rejected_already_running repo=%s pr=%s", repo_id, pr_number)
+                return JSONResponse(status_code=409, content={"status": "already_running"})
+
+            # GitHub's native pull_request payload has no file list inline (unlike
+            # the old Action-built payload) — fetch it here before dispatching.
+            token = await get_installation_token(installation_id)
+            changed_files = await fetch_pr_files(repo_id, pr_number, token)
+
+            _review_in_progress.add(repo_id)
+            background_tasks.add_task(_process_review, {
+                "repo_id": repo_id,
+                "pr_number": pr_number,
+                "base_sha": (pr.get("base") or {}).get("sha"),
+                "head_sha": (pr.get("head") or {}).get("sha"),
+                "commit_message": pr.get("title"),
+                "changed_files": changed_files,
+                "installation_id": installation_id,
+                "trace_id": _new_trace_id(repo_id, pr_number),
+            })
+            return JSONResponse(status_code=202, content={"status": "accepted"})
+
+        if action == "closed" and pr.get("merged") and pr_number:
+            token = await get_installation_token(installation_id)
+            changed_files = await fetch_pr_files(repo_id, pr_number, token)
+            background_tasks.add_task(_process_sync, {
+                "repo_id": repo_id,
+                "commit_hash": pr.get("merge_commit_sha") or (pr.get("head") or {}).get("sha", ""),
+                "changed_files": changed_files,
+                "installation_id": installation_id,
+            })
+            return JSONResponse(status_code=202, content={"status": "accepted"})
+
         return JSONResponse(status_code=202, content={"status": "skipped"})
 
-    background_tasks.add_task(_process_sync, payload)
-    return JSONResponse(status_code=202, content={"status": "accepted"})
+    return JSONResponse(status_code=202, content={"status": "ignored"})
 
 
 @app.post("/admin/reindex", status_code=202)
@@ -632,6 +736,40 @@ async def post_admin_reindex(
     background_tasks.add_task(_process_reindex, payload)
 
     return JSONResponse(status_code=202, content={"status": "accepted"})
+
+
+@app.post("/admin/reindex-all", status_code=202)
+async def post_admin_reindex_all(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    x_hub_signature_256: str | None = Header(default=None),
+) -> JSONResponse:
+    """
+    Reindex every repo the App is installed on.
+
+    Replaces the old per-target-repo weekly_rebuild.yml cron (which didn't
+    scale — every onboarded repo needed its own copy) with a single cron
+    living once in the backend's own repo that hits this endpoint. Repos
+    already mid-reindex are skipped, not queued.
+    """
+    body = await request.body()
+    _verify_signature(body, x_hub_signature_256)
+
+    triggered: list[str] = []
+    for installation in await list_installations():
+        installation_id = installation["id"]
+        for repo_id in await list_installation_repos(installation_id):
+            _installation_id_by_repo[repo_id] = installation_id
+            if repo_id in _reindex_in_progress:
+                continue
+            _reindex_in_progress.add(repo_id)
+            triggered.append(repo_id)
+            background_tasks.add_task(
+                _process_reindex,
+                {"repo_id": repo_id, "branch": "main", "installation_id": installation_id},
+            )
+
+    return JSONResponse(status_code=202, content={"status": "accepted", "repos": triggered})
 
 
 @app.get("/health")

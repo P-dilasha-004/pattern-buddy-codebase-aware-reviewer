@@ -4,6 +4,7 @@ Phase 2, Task 2.2 — Diff extraction and concurrent file fetching.
 Public API
 ----------
 extract_and_fetch(payload, pat) -> FetchResult
+fetch_pr_files(repo_id, pr_number, token) -> list[dict]
 
 FetchResult.fallback is True when the PR touches >50 ingestible files.
 In that case .files is empty and downstream tasks must use the macro-summary
@@ -115,8 +116,10 @@ async def extract_and_fetch(
     concurrently fetch all ingestible file blobs from GitHub.
 
     Args:
-        payload:      Webhook payload from POST /review.
-        pat:          GitHub Personal Access Token for authenticated fetches.
+        payload:      Internal review payload built by POST /webhook's
+                       pull_request handling.
+        pat:          Bearer token for authenticated fetches (a GitHub App
+                       installation token — see api/github_app.py).
         http_timeout: Per-request timeout in seconds (default 30 s).
 
     Returns:
@@ -138,7 +141,7 @@ async def extract_and_fetch(
         return FetchResult()
 
     repo_id = payload.get("repo_id", "")
-    # /review sends head_sha; /sync sends commit_hash. Fall back to HEAD.
+    # Review payloads carry head_sha; merge-sync payloads carry commit_hash.
     ref = payload.get("head_sha") or payload.get("commit_hash") or "HEAD"
 
     # ── Concurrent fetch ──────────────────────────────────────────────────────
@@ -168,3 +171,49 @@ async def extract_and_fetch(
         len(files), len(failed),
     )
     return FetchResult(files=files, failed_paths=failed)
+
+
+async def fetch_pr_files(
+    repo_id: str,
+    pr_number: int,
+    token: str,
+    http_timeout: float = FETCH_TIMEOUT_S,
+) -> list[dict]:
+    """
+    List files changed in a PR via GitHub's REST API, paginating through the
+    Link header (this endpoint returns 30/page by default). Used by the
+    GitHub App webhook path, which — unlike the old Actions-triggered
+    /review — receives a native pull_request payload with no file list
+    inline, so the backend has to fetch it itself (this replaces what
+    `gh api pulls/files --paginate` used to do in the old workflow file).
+
+    Maps GitHub's field names onto the {path, status, previous_path} shape
+    the rest of the pipeline (extract_and_fetch, _process_sync's rename
+    handling) already expects — GitHub calls the old name previous_filename,
+    not previous_path.
+    """
+    files: list[dict] = []
+    url: str | None = f"{GITHUB_API_BASE}/repos/{repo_id}/pulls/{pr_number}/files"
+    params: dict | None = {"per_page": 100}
+
+    async with httpx.AsyncClient(timeout=http_timeout) as client:
+        while url:
+            resp = await client.get(
+                url,
+                params=params,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+            )
+            resp.raise_for_status()
+            for entry in resp.json():
+                mapped = {"path": entry["filename"], "status": entry["status"]}
+                if entry.get("previous_filename"):
+                    mapped["previous_path"] = entry["previous_filename"]
+                files.append(mapped)
+            url = resp.links.get("next", {}).get("url")
+            params = None  # the next URL already carries its own query params
+
+    return files

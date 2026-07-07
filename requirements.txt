@@ -9,3 +9,5 @@ fastapi
 uvicorn
 gunicorn
 httpx
+PyJWT
+cryptography

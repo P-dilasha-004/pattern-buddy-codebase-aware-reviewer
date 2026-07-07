@@ -7,7 +7,7 @@ Covers:
 - _emit_stage_log: JSON schema (planning.md 9.6), appends JSONL to logs/<stage>.json
 - _stage_timer: success path logs status=success with metadata and timing
 - _stage_timer: exception path logs status=failed and re-raises
-- POST /review: trace_id is generated at webhook ingress and forwarded to
+- POST /webhook: trace_id is generated at webhook ingress and forwarded to
   the background task
 - _process_review: all four Task 5.1 stages (diff_fetch, embedding,
   qdrant_retrieval, inference_handoff) get logged under the same trace_id,
@@ -180,16 +180,33 @@ class TestStageTimer:
         assert entry["metadata"] == {"attempted": True}
 
 
-# ── POST /review generates trace_id at ingress ───────────────────────────────
+# ── POST /webhook generates trace_id at ingress ──────────────────────────────
+
+PULL_REQUEST_WEBHOOK_PAYLOAD = {
+    "action": "opened",
+    "number": 42,
+    "pull_request": {
+        "base": {"sha": "aaa111"},
+        "head": {"sha": "bbb222"},
+        "title": "Add auth service",
+        "merged": False,
+    },
+    "repository": {"full_name": "owner/repo"},
+    "installation": {"id": 999999},
+}
+
 
 class TestTraceIdAtIngress:
     def test_trace_id_forwarded_to_background_task(self, client):
-        body = json.dumps(REVIEW_PAYLOAD).encode()
-        with patch("api.main._process_review", new_callable=AsyncMock) as mock_task:
+        body = json.dumps(PULL_REQUEST_WEBHOOK_PAYLOAD).encode()
+        with patch("api.main._process_review", new_callable=AsyncMock) as mock_task, \
+             patch("api.main.get_installation_token", new_callable=AsyncMock, return_value="tok"), \
+             patch("api.main.fetch_pr_files", new_callable=AsyncMock, return_value=[]):
             client.post(
-                "/review",
+                "/webhook",
                 content=body,
                 headers={"x-hub-signature-256": _sign(body),
+                         "x-github-event": "pull_request",
                          "content-type": "application/json"},
             )
         called_with = mock_task.call_args[0][0]
