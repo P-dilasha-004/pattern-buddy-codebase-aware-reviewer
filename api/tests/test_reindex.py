@@ -364,5 +364,4 @@ class TestProcessReindex:
              patch("shutil.rmtree"):
             await m._process_reindex({"repo_id": "owner/repo"})  # no "branch" key
 
-        from api.tests.conftest import FAKE_INSTALLATION_TOKEN
-        mock_dl.assert_called_once_with("owner/repo", "main", FAKE_INSTALLATION_TOKEN)
+        mock_dl.assert_called_once_with("owner/repo", "main", m._PAT)

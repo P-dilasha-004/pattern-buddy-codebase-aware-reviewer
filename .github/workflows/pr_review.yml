@@ -1,0 +1,66 @@
+name: Pattern Buddy PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+# Cancel any in-flight run for the same branch on rapid pushes.
+# Only one review per ref at a time; the latest commit wins.
+concurrency:
+  group: pr-review-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  trigger-review:
+    name: Trigger Pattern Buddy review
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Fetch changed files from GitHub API
+        id: changed
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          FILES_JSON=$(gh api \
+            "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
+            --paginate \
+            --jq '[.[] | {path: .filename, status: .status, raw_url: .raw_url}]')
+          echo "files=$(echo "$FILES_JSON" | jq -c .)" >> "$GITHUB_OUTPUT"
+
+      - name: Build and sign payload, POST to Pattern Buddy
+        env:
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          BACKEND_API_URL: https://pattern-buddy-v2-gabre3endda8gwck.northcentralus-01.azurewebsites.net
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          PAYLOAD=$(jq -cn \
+            --arg repo_id    "${{ github.repository }}" \
+            --argjson pr_number ${{ github.event.pull_request.number }} \
+            --arg base_sha   "${{ github.event.pull_request.base.sha }}" \
+            --arg head_sha   "${{ github.event.pull_request.head.sha }}" \
+            --arg commit_msg "${{ github.event.pull_request.title }}" \
+            --argjson changed_files '${{ steps.changed.outputs.files }}' \
+            '{
+              repo_id: $repo_id,
+              pr_number: $pr_number,
+              base_sha: $base_sha,
+              head_sha: $head_sha,
+              commit_message: $commit_msg,
+              changed_files: $changed_files
+            }')
+
+          SIGNATURE="sha256=$(echo -n "$PAYLOAD" | \
+            openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" | \
+            awk '{print $2}')"
+
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X POST "${BACKEND_API_URL}/review" \
+            -H "Content-Type: application/json" \
+            -H "X-Hub-Signature-256: ${SIGNATURE}" \
+            -d "$PAYLOAD")
+
+          echo "Response status: $HTTP_STATUS"
+          if [ "$HTTP_STATUS" != "202" ]; then
+            echo "ERROR: Expected 202 Accepted, got $HTTP_STATUS"
+            exit 1
+          fi
