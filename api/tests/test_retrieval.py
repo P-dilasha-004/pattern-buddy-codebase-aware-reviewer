@@ -176,14 +176,16 @@ class TestPromptStructure:
         result = retrieve_and_assemble(FILES, PAYLOAD, client, embedder)
         assert "All functions must have tests." in result.prompt
 
-    def test_system_block_before_context_block(self):
+    def test_system_block_before_diff_before_context_block(self):
+        # Diff comes before repository context so the model identifies exactly
+        # what's new/modified before the (much larger) context block arrives.
         client  = _make_qdrant([])
         embedder = _make_embedder()
         result = retrieve_and_assemble(FILES, PAYLOAD, client, embedder)
         sys_pos  = result.prompt.index("SYSTEM")
-        ctx_pos  = result.prompt.index("REPOSITORY CONTEXT")
         diff_pos = result.prompt.index("PULL REQUEST DIFF")
-        assert sys_pos < ctx_pos < diff_pos
+        ctx_pos  = result.prompt.index("=========================\nREPOSITORY CONTEXT")
+        assert sys_pos < diff_pos < ctx_pos
 
 
 # ── Zero chunks retrieved ─────────────────────────────────────────────────────
@@ -357,8 +359,12 @@ class TestMacroPrompt:
         assert "src/module_0.py" in prompt
 
     def test_macro_prompt_no_qdrant_context_block(self):
+        # SYSTEM's own prose mentions "REPOSITORY CONTEXT" in passing (instructing
+        # the model to only enforce rules from it) — what must be absent from the
+        # macro path is the actual section header, since there are no retrieved
+        # chunks to populate it with.
         prompt = build_macro_prompt(self._large_payload())
-        assert "REPOSITORY CONTEXT" not in prompt
+        assert "=========================\nREPOSITORY CONTEXT\n=========================" not in prompt
 
     def test_macro_prompt_has_task_block(self):
         prompt = build_macro_prompt(self._large_payload())

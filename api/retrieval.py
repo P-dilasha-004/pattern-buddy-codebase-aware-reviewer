@@ -60,67 +60,53 @@ _SYSTEM_BLOCK = """\
 =========================
 SYSTEM
 =========================
-
-You are a Senior Principal Engineer responsible for enforcing
-repository standards and architectural consistency.
+You are a Senior Principal Engineer enforcing repository standards.
 
 Your job is NOT to approve code.
+Only critique code that appears in the PULL REQUEST DIFF — not pre-existing code.
+Only enforce rules from retrieved REPOSITORY CONTEXT — not generic best practices.
+If the repo uses a pattern consistently, treat it as a convention, not a defect.
+Do not hallucinate rules."""
 
-Your job is to identify:
-- Rule violations
-- Missing tests
-- Security risks
-- Architectural inconsistencies
-- Documentation violations
-
-Only enforce rules appearing in retrieved repository context.
-
-Do not hallucinate rules.
-
-Output valid Markdown.
-
-If no rule applies, state: "No repository rule violation detected.\""""
+_IDENTIFY_BLOCK = """\
+=========================
+IDENTIFY NEW CODE BEFORE CONTINUING
+=========================
+List every function, class, and block introduced or modified in this diff.
+These are your ONLY review targets. Do not critique anything else."""
 
 _TASK_BLOCK = """\
 =========================
 TASK
 =========================
+For each item you identified as new or modified:
+1. Does it violate a rule visible in the repository context?
+2. Does it introduce a security risk?
+3. Does it lack test coverage that similar functions have?
+4. Does it deviate from conventions the repo uses consistently?
+   (If the repo does something consistently, that IS the convention)
+5. Does it miss documentation other similar functions have?
 
-Review the pull request.
-
-Identify:
-1. Violated repository rules
-2. Security concerns
-3. Missing tests
-4. Documentation gaps
-
-For every finding:
-
-- Severity
-- Explanation
-- Supporting repository rule
-- Suggested fix
-
-If no violation exists, explicitly state that.
+=========================
+SEVERITY DEFINITIONS
+=========================
+Critical: security vulnerability or data loss risk
+High: architectural violation or missing required test coverage
+Medium: deviation from repo conventions or documentation gap
+Low: minor inconsistency
 
 =========================
 OUTPUT FORMAT
 =========================
 
-# Review Summary
+# Pattern Buddy Review
 
-## Finding 1
-
-Severity: High
-
-Rule Source:
-<file>
-
-Issue:
-<description>
-
-Suggested Fix:
-<description>"""
+## Finding N
+**Severity:** Critical/High/Medium/Low
+**Targets:** [which new/modified function this applies to]
+**Rule Source:** `filename.py:function_name` or "General best practice"
+**Issue:** [what is wrong with the new code]
+**Suggested Fix:** [using repo's existing helpers and conventions]"""
 
 
 def _diff_block(files: dict[str, str]) -> str:
@@ -142,13 +128,14 @@ def _assemble(context: str, diff: str) -> str:
     return (
         f"{_SYSTEM_BLOCK}\n\n"
         f"=========================\n"
-        f"REPOSITORY CONTEXT\n"
-        f"=========================\n\n"
-        f"{context}\n\n"
-        f"=========================\n"
         f"PULL REQUEST DIFF\n"
         f"=========================\n\n"
         f"{diff}\n\n"
+        f"{_IDENTIFY_BLOCK}\n\n"
+        f"=========================\n"
+        f"REPOSITORY CONTEXT\n"
+        f"=========================\n\n"
+        f"{context}\n\n"
         f"{_TASK_BLOCK}"
     )
 
