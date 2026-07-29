@@ -228,11 +228,6 @@ ongoing optimization work.
 
 ### Also worth knowing
 
-- **Embedding has a cold-start penalty.** The embedding model is loaded
-  lazily on first use per worker process, with no startup warmup. The first
-  `/review` after any deploy or worker restart can take several seconds to
-  tens of seconds longer than a "warm" review purely on the embedding step,
-  before any LLM call even happens.
 - **Review quality depends on ingestion having actually happened.** A repo
   that hasn't been ingested (or was only partially ingested, per the
   limitation above) still gets reviewed, just without codebase-specific
