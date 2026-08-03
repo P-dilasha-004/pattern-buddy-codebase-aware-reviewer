@@ -40,53 +40,6 @@ diff-only reviewer structurally cannot make.
 
 ---
 
-## How it works
-
-### End-to-end flow
-
-```
-PR opened/updated on GitHub
-        │
-        ▼
-GitHub Actions workflow (.github/workflows/pr_review.yml)
-  - fetches the PR's changed-file list via the GitHub API
-  - builds a lightweight JSON payload (repo, PR #, base/head SHA, changed files)
-  - HMAC-SHA256 signs it with a shared webhook secret
-  - POSTs it to the Pattern Buddy backend
-        │
-        ▼
-Backend: POST /review  (Azure App Service, FastAPI)
-  - verifies the HMAC signature — rejects anything unsigned/forged (401)
-  - checks a per-repo concurrency guard — a repo already being reviewed
-    gets a 409 instead of a second overlapping review
-  - returns 202 Accepted IMMEDIATELY and keeps working in a background task
-    (this is what keeps the GitHub Actions runner from blocking for the
-    ~15-30s the actual pipeline takes)
-        │
-        ▼  (background task, from here on)
-1. Concurrent file fetch — every changed file's raw content is fetched from
-   GitHub in parallel (asyncio.gather), with per-file failure isolation: one
-   file 404ing doesn't abort the batch, it's just excluded and logged.
-   PRs touching more than 50 files skip straight to a macro-level,
-   commit-message-only review instead of trying to process everything.
-2. Embedding — the diff is embedded locally in-process using
-   nomic-embed-text-v1.5 (via fastembed/ONNX, no external embedding API call).
-3. Retrieval — the diff's embedding is used to query Qdrant for the top 5
-   most similar chunks of the *same repository's* pre-ingested code/docs
-   (cosine similarity, score ≥ 0.60). Every query is hard-filtered on
-   repo_id server-side, so one repo's context can never leak into another
-   repo's review even if something upstream misbehaves.
-4. Prompt assembly — system instructions + retrieved repository context +
-   the PR diff are assembled into a single prompt, capped at 6,000 input
-   tokens (chunks are dropped lowest-score-first if it doesn't fit).
-5. Inference — the prompt goes to an LLM (currently Gemini 2.5 Flash) to
-   generate a structured Markdown review: findings with severity, the
-   specific repository rule/convention each one cites, and a suggested fix.
-   If no real violation is found, it says so explicitly rather than
-   padding the review with generic advice.
-6. The generated review is posted back to the PR as a GitHub comment.
-```
-
 ### Ingesting a repository (what makes review "codebase-aware" at all)
 
 Before Pattern Buddy can review a repo's PRs with real context, the repo has
